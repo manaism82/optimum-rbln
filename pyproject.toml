@@ -34,7 +34,10 @@ dependencies = [
     "torchvision==0.25.0; platform_machine == 'aarch64' and platform_python_implementation == 'CPython'",
     "torchvision==0.25.0+cpu; platform_machine == 'x86_64' and platform_python_implementation == 'CPython'",
     "accelerate>=1.0.1",
-    "transformers==4.57.6",
+    # Allow both 4.x (default) and 5.5.1+ (required for Qwen3.5-MoE / Qwen3_5MoeConfig).
+    # Mirrors vLLM's compatibility window. transformers 5.x is auto-handled by
+    # optimum/rbln/_transformers5_compat.py (no-op on 4.x).
+    "transformers >= 4.56.0, != 5.0.*, != 5.1.*, != 5.2.*, != 5.3.*, != 5.4.*, != 5.5.0",
     "diffusers==0.37.0",
     "packaging>=24.1",
 ]

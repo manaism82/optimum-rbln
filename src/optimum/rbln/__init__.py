@@ -14,6 +14,10 @@
 
 from typing import TYPE_CHECKING
 
+# Apply transformers 5.x compatibility shim before any other optimum-rbln imports.
+# This is a no-op on transformers 4.x.
+from . import _transformers5_compat  # noqa: F401
+
 from transformers.utils import _LazyModule
 
 from .__version__ import __version__
@@ -186,6 +190,12 @@ _import_structure = {
         "RBLNQwen3VLMoeForConditionalGenerationConfig",
         "RBLNQwen3VLMoeModel",
         "RBLNQwen3VLMoeModelConfig",
+        "RBLNQwen3_5MoeVisionModel",
+        "RBLNQwen3_5MoeVisionModelConfig",
+        "RBLNQwen3_5MoeForConditionalGeneration",
+        "RBLNQwen3_5MoeForConditionalGenerationConfig",
+        "RBLNQwen3_5MoeModel",
+        "RBLNQwen3_5MoeModelConfig",
         "RBLNQwen2VisionTransformerPretrainedModel",
         "RBLNQwen2VisionTransformerPretrainedModelConfig",
         "RBLNQwen2VLForConditionalGeneration",
@@ -534,6 +544,12 @@ if TYPE_CHECKING:
         RBLNQwen3VLMoeVisionModelConfig,
         RBLNQwen3VLVisionModel,
         RBLNQwen3VLVisionModelConfig,
+        RBLNQwen3_5MoeForConditionalGeneration,
+        RBLNQwen3_5MoeForConditionalGenerationConfig,
+        RBLNQwen3_5MoeModel,
+        RBLNQwen3_5MoeModelConfig,
+        RBLNQwen3_5MoeVisionModel,
+        RBLNQwen3_5MoeVisionModelConfig,
         RBLNResNetForImageClassification,
         RBLNResNetForImageClassificationConfig,
         RBLNRobertaForMaskedLM,
