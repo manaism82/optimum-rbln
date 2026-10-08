@@ -426,6 +426,7 @@ QWEN_VL_VISION_CONFIGS = [
     ("RBLNQwen2_5_VLForConditionalGenerationConfig", "RBLNQwen2_5_VisionTransformerPretrainedModelConfig"),
     ("RBLNQwen3VLForConditionalGenerationConfig", "RBLNQwen3VLVisionModelConfig"),
     ("RBLNQwen3_5ForConditionalGenerationConfig", "RBLNQwen3_5VisionModelConfig"),
+    ("RBLNQwen3_5MoeForConditionalGenerationConfig", "RBLNQwen3_5MoeVisionModelConfig"),
     ("RBLNExaone4_5_ForConditionalGenerationConfig", "RBLNExaone4_5_VisionModelConfig"),
 ]
 
