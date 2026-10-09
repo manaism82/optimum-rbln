@@ -136,7 +136,20 @@ class RBLNQwen3_5TextModelConfig(RBLNDecoderOnlyModelConfig):
 class RBLNQwen3_5VisionModelConfig(RBLNModelConfig):
     """Vision encoder config for Qwen3.5: per-image `max_seq_len`."""
 
-    def __init__(self, max_seq_len: int | list[int] = None, batch_size: int = 1, **kwargs: Any):
+    # The position-embedding cache lives on the host and never reaches the compiled graph, so its size is a
+    # load-time option: it is not written to rbln_config.json and can be changed when loading a compiled model.
+    # It is kept in `_runtime_options` like `device` because that is what survives the reload of a submodule
+    # config: the parent loads `visual` from its own rbln_config.json and carries over only `_runtime_options`
+    # of the config it was given.
+    subclass_non_save_attributes = ["pos_embed_cache_size"]
+
+    def __init__(
+        self,
+        max_seq_len: int | list[int] = None,
+        batch_size: int = 1,
+        pos_embed_cache_size: int | None = None,
+        **kwargs: Any,
+    ):
         """
         Args:
             max_seq_len (Optional[Union[int, List[int]]]): Vision Transformer attention max sequence
@@ -144,16 +157,23 @@ class RBLNQwen3_5VisionModelConfig(RBLNModelConfig):
                 set this to the max expected resolution to bound compute. Required.
             batch_size (int): the vision encoder runs one image at a time (the parent config forces this
                 by default).
+            pos_embed_cache_size (Optional[int]): Number of image sizes (patch grid height x width) whose
+                interpolated position embeddings are kept on the host, so a repeated size skips the
+                interpolation. The least recently used size is dropped first; 0 disables the cache. One entry
+                holds height x width x vision hidden size float32 values. Defaults to 16.
             kwargs: Additional arguments passed to the parent RBLNModelConfig.
 
         Raises:
-            ValueError: If `max_seq_len` is None or not provided, or if `batch_size` is not 1.
+            ValueError: If `max_seq_len` is None or not provided, if `batch_size` is not 1, or if
+                `pos_embed_cache_size` is not an integer >= 0.
         """
         super().__init__(**kwargs)
 
         if batch_size != 1:
             raise ValueError(f"The Qwen3.5 vision encoder only supports batch_size=1, got {batch_size}.")
         self.batch_size = batch_size
+
+        self.pos_embed_cache_size = 16 if pos_embed_cache_size is None else pos_embed_cache_size
 
         if max_seq_len is not None:
             if isinstance(max_seq_len, int):
@@ -164,6 +184,20 @@ class RBLNQwen3_5VisionModelConfig(RBLNModelConfig):
             raise ValueError("'max_seq_len' must be specified.")
 
         self.max_seq_len = max_seq_len
+
+    @property
+    def pos_embed_cache_size(self) -> int:
+        return self._runtime_options["pos_embed_cache_size"]
+
+    @pos_embed_cache_size.setter
+    def pos_embed_cache_size(self, pos_embed_cache_size: int):
+        if (
+            isinstance(pos_embed_cache_size, bool)
+            or not isinstance(pos_embed_cache_size, int)
+            or pos_embed_cache_size < 0
+        ):
+            raise ValueError(f"pos_embed_cache_size must be an integer >= 0, got {pos_embed_cache_size!r}.")
+        self._runtime_options["pos_embed_cache_size"] = pos_embed_cache_size
 
 
 class RBLNQwen3_5ModelConfig(RBLNDecoderOnlyModelConfig):
