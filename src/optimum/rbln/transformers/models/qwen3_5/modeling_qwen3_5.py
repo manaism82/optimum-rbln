@@ -226,13 +226,15 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
                 kvcache_dtype = "float8_e4m3fn"
 
             # conv/recurrent caches are one shared static tensor, so sized to the max batch (not batch_size=1 for
-            # prefill). Prefill writes its own slot (batch_idx); decode runs the full batch.
+            # prefill). Prefill writes its own slot (batch_idx); decode runs the full batch. The
+            # `linear_state_snapshot_slots` prefix-snapshot rows follow the max-batch rows.
             _state_dtype = RBLNCompileConfig.normalize_dtype(rbln_config.dtype)
+            state_rows = rbln_config.batch_size + rbln_config.linear_state_snapshot_slots
             cache_metas = []
             for layer_idx in range(num_hidden_layers):
                 if layer_idx in linear_layers:
                     # recurrent cache is stored 3D (B, Hv*Dk, Dv); GatedDeltaNet reshapes to 4D internally.
-                    conv_shape, recurrent_shape = _qwen3_5_linear_state_shapes(text_config, rbln_config.batch_size)
+                    conv_shape, recurrent_shape = _qwen3_5_linear_state_shapes(text_config, state_rows)
                     cache_metas.append(
                         LinearAttentionCacheMeta.from_config(
                             f"conv_state_{layer_idx}", layer_idx, shape=list(conv_shape), dtype=_state_dtype
@@ -270,6 +272,10 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
             # prefill only: which max-batch slot this per-item (batch=1) call reads/writes in the linear caches.
             if is_prefill:
                 input_info.append(("batch_idx", [], "int16"))
+                # With snapshot rows, the row the window READS its carried state from is a separate input
+                # (`batch_idx` stays the row it WRITES), so a window can resume from or capture into a snapshot.
+                if rbln_config.linear_state_snapshot_slots > 0:
+                    input_info.append(("state_src_idx", [], "int16"))
 
         return input_info
 

@@ -556,6 +556,10 @@ class Qwen3_5Model(DecoderOnlyModel):
     def __init__(self, model, layers, rbln_config, use_learned_pos_emb=None, use_rotary_emb=True):
         super().__init__(model, layers, rbln_config, use_learned_pos_emb, use_rotary_emb)
         self.linear_attention_layers = rbln_config.linear_attention_layers
+        # The linear-state caches hold `batch_size` live rows followed by `linear_state_snapshot_slots` prefix
+        # snapshot rows. Decode must only touch the live rows.
+        self.linear_state_snapshot_slots = getattr(rbln_config, "linear_state_snapshot_slots", 0)
+        self.linear_state_live_rows = rbln_config.batch_size
 
     def forward(
         self,
@@ -576,6 +580,7 @@ class Qwen3_5Model(DecoderOnlyModel):
         valid_mask: torch.Tensor | None = None,
         batch_idx: torch.Tensor | None = None,  # prefill only: which max-batch cache slot this item uses
         output_hidden_states: bool | None = None,
+        state_src_idx: torch.Tensor | None = None,  # prefill only: the state row to read (default: batch_idx)
     ):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
@@ -608,10 +613,17 @@ class Qwen3_5Model(DecoderOnlyModel):
                 conv_state, recurrent_state = past_states[layer_idx]
                 slotted = batch_idx is not None
                 if slotted:
-                    # PREFILL processes ONE item -> take its slot [batch_idx] from the max-batch cache -> (1, ...).
-                    conv_in = conv_state[batch_idx.to(torch.int).unsqueeze(0)]
-                    recurrent_in = recurrent_state[batch_idx.to(torch.int).unsqueeze(0)]
+                    # PREFILL processes ONE item -> take its slot from the max-batch cache -> (1, ...). It reads
+                    # row `state_src_idx` (a prefix snapshot row, when given) and writes row `batch_idx`.
+                    read_idx = state_src_idx if state_src_idx is not None else batch_idx
+                    conv_in = conv_state[read_idx.to(torch.int).unsqueeze(0)]
+                    recurrent_in = recurrent_state[read_idx.to(torch.int).unsqueeze(0)]
                     _pos = batch_idx.to(torch.int16)
+                elif self.linear_state_snapshot_slots > 0:
+                    # DECODE runs the live rows [0, batch_size) only; the snapshot rows after them stay untouched.
+                    conv_in = conv_state[: self.linear_state_live_rows]
+                    recurrent_in = recurrent_state[: self.linear_state_live_rows]
+                    _pos = torch.tensor(0, dtype=torch.int16)
                 else:
                     conv_in, recurrent_in = conv_state, recurrent_state
                     _pos = torch.tensor(0, dtype=torch.int16)
@@ -669,6 +681,7 @@ class Qwen3_5ForCausalLM(DecoderOnlyForCausalLM):
         valid_mask: torch.Tensor | None = None,
         batch_idx: torch.Tensor | None = None,
         output_hidden_states: bool | None = None,
+        state_src_idx: torch.Tensor | None = None,
     ):
         hidden_states, new_states, all_hidden_states = self.model(
             input_ids=input_ids,
@@ -688,6 +701,7 @@ class Qwen3_5ForCausalLM(DecoderOnlyForCausalLM):
             valid_mask=valid_mask,
             batch_idx=batch_idx,
             output_hidden_states=output_hidden_states,
+            state_src_idx=state_src_idx,
         )
 
         if "prefill" in self.phase and query_position is not None:
@@ -751,13 +765,27 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
         past_states = [pair if i in linear else None for i, pair in enumerate(pairs)]
         return past_key_values, past_states
 
-    def prepare_forward_args(self, *args):
-        args = list(args)
+    def _pop_linear_state_inputs(self, args: list):
+        """Pop the trailing linear-attention inputs (see `get_input_info`) off `args`, last one first.
+
+        Order in the graph: ..., conv_state_mask, recurrent_state_mask, valid_mask, [batch_idx (prefill)],
+        [state_src_idx (prefill, linear_state_snapshot_slots > 0)].
+        """
         has_linear = any(t == "linear_attention" for t in self.config.layer_types)
-        batch_idx = args.pop() if (has_linear and "prefill" in self.phase) else None
+        is_prefill = has_linear and "prefill" in self.phase
+        snapshot_slots = getattr(self.rbln_config, "linear_state_snapshot_slots", 0)
+        state_src_idx = args.pop() if (is_prefill and snapshot_slots > 0) else None
+        batch_idx = args.pop() if is_prefill else None
         valid_mask = args.pop() if has_linear else None
         recurrent_state_mask = args.pop() if has_linear else None
         conv_state_mask = args.pop() if has_linear else None
+        return conv_state_mask, recurrent_state_mask, valid_mask, batch_idx, state_src_idx
+
+    def prepare_forward_args(self, *args):
+        args = list(args)
+        conv_state_mask, recurrent_state_mask, valid_mask, batch_idx, state_src_idx = self._pop_linear_state_inputs(
+            args
+        )
 
         (
             input_ids,
@@ -792,6 +820,7 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
             recurrent_state_mask,
             valid_mask,
             batch_idx,
+            state_src_idx,
         )
 
     def forward(self, *args):
@@ -812,6 +841,7 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
             recurrent_state_mask,
             valid_mask,
             batch_idx,
+            state_src_idx,
         ) = self.prepare_forward_args(*args)
 
         logits, new_states, all_hidden_states = self.model(
@@ -832,6 +862,7 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
             valid_mask=valid_mask,
             batch_idx=batch_idx,
             output_hidden_states=self.rbln_config.output_hidden_states,
+            state_src_idx=state_src_idx,
         )
 
         # Linear-attention state updates are returned so the runtime can persist them on the host; the
@@ -860,11 +891,9 @@ class Qwen3_5_LanguageModelWrapper(Qwen3_5_CausalLMWrapper):
 
     def prepare_forward_args(self, *args):
         args = list(args)
-        has_linear = any(t == "linear_attention" for t in self.config.layer_types)
-        batch_idx = args.pop() if (has_linear and "prefill" in self.phase) else None
-        valid_mask = args.pop() if has_linear else None
-        recurrent_state_mask = args.pop() if has_linear else None
-        conv_state_mask = args.pop() if has_linear else None
+        conv_state_mask, recurrent_state_mask, valid_mask, batch_idx, state_src_idx = self._pop_linear_state_inputs(
+            args
+        )
         input_ids = None if self.rbln_config.use_inputs_embeds else args.pop(0)
         inputs_embeds = args.pop(0) if self.rbln_config.use_inputs_embeds else None
         cache_position = args.pop(0)
@@ -900,4 +929,5 @@ class Qwen3_5_LanguageModelWrapper(Qwen3_5_CausalLMWrapper):
             recurrent_state_mask,
             valid_mask,
             batch_idx,
+            state_src_idx,
         )

@@ -18,6 +18,22 @@ from ....configuration_utils import RBLNModelConfig
 from ..decoderonly.configuration_decoderonly import RBLNDecoderOnlyModelConfig, RBLNDecoderOnlyModelForCausalLMConfig
 
 
+def _validate_linear_state_snapshot_slots(config: RBLNDecoderOnlyModelConfig) -> None:
+    """Validate `linear_state_snapshot_slots` (K) on a Qwen3.5 config.
+
+    K > 0 appends K snapshot rows after the `batch_size` live rows of every GatedDeltaNet state cache. The decode
+    graph reads and writes only the live rows, so it must run the full `batch_size` (a single decoder).
+    """
+    slots = config.linear_state_snapshot_slots
+    if isinstance(slots, bool) or not isinstance(slots, int) or slots < 0:
+        raise ValueError(f"linear_state_snapshot_slots must be an integer >= 0, got {slots!r}.")
+    if slots > 0 and config.can_generate and config.decoder_batch_sizes != [config.batch_size]:
+        raise ValueError(
+            "linear_state_snapshot_slots > 0 requires a single decoder of batch_size "
+            f"(decoder_batch_sizes == [{config.batch_size}]), got decoder_batch_sizes={config.decoder_batch_sizes}."
+        )
+
+
 class RBLNQwen3_5ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     """
     Configuration class for RBLN Qwen3.5 (text backbone) causal language models.
@@ -27,7 +43,8 @@ class RBLNQwen3_5ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     standard paged KV cache; linear-attention layers instead carry a `conv_state` and a
     `recurrent_state`. Which layers are linear is read from the HF `config.layer_types` into the internal
     `linear_attention_layers` field; this config extends `RBLNDecoderOnlyModelForCausalLMConfig` with
-    `gdn_chunk_size` and `linear_attention_layers`.
+    `gdn_chunk_size`, `linear_attention_layers` and `linear_state_snapshot_slots` (GatedDeltaNet state rows
+    for hybrid prefix caching).
 
     Example usage:
     ```python
@@ -46,6 +63,7 @@ class RBLNQwen3_5ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
         self,
         gdn_chunk_size: int | None = None,
         linear_attention_layers: list[int] | None = None,
+        linear_state_snapshot_slots: int = 0,
         **kwargs: Any,
     ):
         """
@@ -55,11 +73,23 @@ class RBLNQwen3_5ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
                 delta rule. Must divide `prefill_chunk_size`. `None` -> `prefill_chunk_size` (no split).
             linear_attention_layers (list[int] | None): The linear_attention (GatedDeltaNet)
                 layer indices, populated automatically from `layer_types` at compile time (not user-set).
+            linear_state_snapshot_slots (int): Number K of extra GatedDeltaNet state rows used as prefix
+                snapshots for hybrid prefix caching. Defaults to 0 (off). With K > 0 every `conv_state_*` /
+                `recurrent_state_*` cache has `batch_size + K` rows (snapshot `s` is row `batch_size + s`),
+                the prefill graph takes an extra `state_src_idx` input (the row a window reads its carried
+                state from; `batch_idx` stays the row it writes) and `decoder_batch_sizes` must be
+                `[batch_size]`. With K = 0 the compiled graphs are unchanged.
             kwargs: Additional arguments passed to `RBLNDecoderOnlyModelForCausalLMConfig`.
+
+        Raises:
+            ValueError: If `linear_state_snapshot_slots` is not an integer >= 0, or is > 0 while
+                `decoder_batch_sizes` != [batch_size].
         """
         super().__init__(**kwargs)
         self.gdn_chunk_size = gdn_chunk_size
         self.linear_attention_layers = linear_attention_layers or []
+        self.linear_state_snapshot_slots = linear_state_snapshot_slots
+        _validate_linear_state_snapshot_slots(self)
 
 
 class RBLNQwen3_5TextModelConfig(RBLNDecoderOnlyModelConfig):
@@ -74,6 +104,7 @@ class RBLNQwen3_5TextModelConfig(RBLNDecoderOnlyModelConfig):
         self,
         gdn_chunk_size: int | None = None,
         linear_attention_layers: list[int] | None = None,
+        linear_state_snapshot_slots: int = 0,
         **kwargs: Any,
     ):
         """
@@ -83,11 +114,23 @@ class RBLNQwen3_5TextModelConfig(RBLNDecoderOnlyModelConfig):
                 delta rule. Must divide `prefill_chunk_size`. `None` -> `prefill_chunk_size` (no split).
             linear_attention_layers (list[int] | None): The linear_attention (GatedDeltaNet)
                 layer indices, populated automatically from `layer_types` at compile time (not user-set).
+            linear_state_snapshot_slots (int): Number K of extra GatedDeltaNet state rows used as prefix
+                snapshots for hybrid prefix caching. Defaults to 0 (off). With K > 0 every `conv_state_*` /
+                `recurrent_state_*` cache has `batch_size + K` rows (snapshot `s` is row `batch_size + s`),
+                the prefill graph takes an extra `state_src_idx` input (the row a window reads its carried
+                state from; `batch_idx` stays the row it writes) and `decoder_batch_sizes` must be
+                `[batch_size]`. With K = 0 the compiled graphs are unchanged.
             kwargs: Additional arguments passed to `RBLNDecoderOnlyModelConfig`.
+
+        Raises:
+            ValueError: If `linear_state_snapshot_slots` is not an integer >= 0, or is > 0 while
+                `decoder_batch_sizes` != [batch_size].
         """
         super().__init__(**kwargs)
         self.gdn_chunk_size = gdn_chunk_size
         self.linear_attention_layers = linear_attention_layers or []
+        self.linear_state_snapshot_slots = linear_state_snapshot_slots
+        _validate_linear_state_snapshot_slots(self)
 
 
 class RBLNQwen3_5VisionModelConfig(RBLNModelConfig):
@@ -143,6 +186,7 @@ class RBLNQwen3_5ModelConfig(RBLNDecoderOnlyModelConfig):
         linear_attention_layers: list[int] | None = None,
         visual: RBLNModelConfig | None = None,
         _load_visual_runtime: bool = True,
+        linear_state_snapshot_slots: int = 0,
         **kwargs: Any,
     ):
         """
@@ -155,10 +199,18 @@ class RBLNQwen3_5ModelConfig(RBLNDecoderOnlyModelConfig):
             visual (Optional[RBLNModelConfig]): Configuration for the vision encoder submodule.
             _load_visual_runtime (bool): Whether to create the visual encoder runtime (False on
                 decoder-only nodes in a disaggregated setup). Defaults to True.
+            linear_state_snapshot_slots (int): Number K of extra GatedDeltaNet state rows used as prefix
+                snapshots for hybrid prefix caching. Defaults to 0 (off). With K > 0 every `conv_state_*` /
+                `recurrent_state_*` cache has `batch_size + K` rows (snapshot `s` is row `batch_size + s`),
+                the prefill graph takes an extra `state_src_idx` input (the row a window reads its carried
+                state from; `batch_idx` stays the row it writes) and `decoder_batch_sizes` must be
+                `[batch_size]`. With K = 0 the compiled graphs are unchanged.
             kwargs: Additional arguments passed to `RBLNDecoderOnlyModelConfig`.
 
         Raises:
             ValueError: If `use_inputs_embeds` is False.
+            ValueError: If `linear_state_snapshot_slots` is not an integer >= 0, or is > 0 while
+                `decoder_batch_sizes` != [batch_size].
         """
         super().__init__(**kwargs)
         if not getattr(self, "use_inputs_embeds", True):
@@ -171,6 +223,8 @@ class RBLNQwen3_5ModelConfig(RBLNDecoderOnlyModelConfig):
         self._load_visual_runtime = _load_visual_runtime
         self.gdn_chunk_size = gdn_chunk_size
         self.linear_attention_layers = linear_attention_layers or []
+        self.linear_state_snapshot_slots = linear_state_snapshot_slots
+        _validate_linear_state_snapshot_slots(self)
 
 
 class RBLNQwen3_5ForConditionalGenerationConfig(RBLNDecoderOnlyModelForCausalLMConfig):
@@ -206,6 +260,7 @@ class RBLNQwen3_5ForConditionalGenerationConfig(RBLNDecoderOnlyModelForCausalLMC
         use_inputs_embeds: bool = True,
         visual: RBLNModelConfig | None = None,
         _load_visual_runtime: bool = True,
+        linear_state_snapshot_slots: int = 0,
         **kwargs: Any,
     ):
         """
@@ -220,10 +275,18 @@ class RBLNQwen3_5ForConditionalGenerationConfig(RBLNDecoderOnlyModelForCausalLMC
             _load_visual_runtime (bool): Whether to create the visual encoder runtime. Set False on
                 decoder-only nodes in a disaggregated setup (then pre-computed image_embeds must be fed to
                 forward()). Defaults to True.
+            linear_state_snapshot_slots (int): Number K of extra GatedDeltaNet state rows used as prefix
+                snapshots for hybrid prefix caching. Defaults to 0 (off). With K > 0 every `conv_state_*` /
+                `recurrent_state_*` cache has `batch_size + K` rows (snapshot `s` is row `batch_size + s`),
+                the prefill graph takes an extra `state_src_idx` input (the row a window reads its carried
+                state from; `batch_idx` stays the row it writes) and `decoder_batch_sizes` must be
+                `[batch_size]`. With K = 0 the compiled graphs are unchanged.
             kwargs: Additional arguments passed to `RBLNDecoderOnlyModelForCausalLMConfig`.
 
         Raises:
             ValueError: If `use_inputs_embeds` is False.
+            ValueError: If `linear_state_snapshot_slots` is not an integer >= 0, or is > 0 while
+                `decoder_batch_sizes` != [batch_size].
         """
         super().__init__(use_inputs_embeds=use_inputs_embeds, **kwargs)
         if not self.use_inputs_embeds:
@@ -236,3 +299,5 @@ class RBLNQwen3_5ForConditionalGenerationConfig(RBLNDecoderOnlyModelForCausalLMC
         self._load_visual_runtime = _load_visual_runtime
         self.gdn_chunk_size = gdn_chunk_size
         self.linear_attention_layers = linear_attention_layers or []
+        self.linear_state_snapshot_slots = linear_state_snapshot_slots
+        _validate_linear_state_snapshot_slots(self)
